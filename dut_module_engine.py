@@ -913,4 +913,3 @@ class DUT_MCMC_Sampler:
 if __name__ == "__main__":
     rodar_simulacao_cobaya()
 
-
