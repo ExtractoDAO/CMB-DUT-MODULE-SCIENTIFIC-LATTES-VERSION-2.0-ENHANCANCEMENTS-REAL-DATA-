@@ -6,7 +6,7 @@ FastAPI web service for running and visualizing Dead Universe Theory (DUT) cosmo
 
 ### Prerequisites
 
-- Python >= 3.9
+- Python >= 3.9 (recommended: Python 3.11)
 - pip (Python package manager)
 
 ### Installation
@@ -18,6 +18,10 @@ FastAPI web service for running and visualizing Dead Universe Theory (DUT) cosmo
 2. **Install dependencies**
 
    ```bash
+   # Upgrade pip and build tools first
+   pip install --upgrade pip setuptools wheel
+
+   # Install requirements
    pip install -r requirements.txt
    ```
 
@@ -40,6 +44,43 @@ FastAPI web service for running and visualizing Dead Universe Theory (DUT) cosmo
    ```
    http://localhost:8000
    ```
+
+## 🌐 Deployment on Render.com
+
+### Option 1: Using Render Dashboard
+
+1. Create a new Web Service on Render
+2. Connect your GitHub repository
+3. Configure the service:
+   - **Runtime**: Python 3.11
+   - **Build Command**: `bash build.sh` or `pip install --upgrade pip setuptools wheel && pip install -r requirements.txt`
+   - **Start Command**: `uvicorn main:app --host 0.0.0.0 --port $PORT`
+4. Add environment variables (if needed):
+   - `PYTHON_VERSION`: 3.11.9
+5. Deploy!
+
+### Option 2: Using render.yaml
+
+Include the `render.yaml` file in your repository root. Render will automatically detect and use it.
+
+### Troubleshooting Render Deployment
+
+**Issue: Python 3.13 compatibility errors**
+
+- Solution: Use `runtime.txt` to specify Python 3.11
+- Add `python-3.11.9` to `runtime.txt`
+
+**Issue: setuptools import error**
+
+- Solution: Ensure build command upgrades pip and setuptools first:
+  ```bash
+  pip install --upgrade pip setuptools wheel && pip install -r requirements.txt
+  ```
+
+**Issue: Build takes too long / timeout**
+
+- Solution: Add `PIP_NO_CACHE_DIR=1` environment variable
+- Use `--no-cache-dir` flag in pip install commands
 
 ## 📡 API Endpoints
 

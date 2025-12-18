@@ -1,19 +1,26 @@
 # FastAPI Web Service Requirements
-# Python >= 3.9
+# Python >= 3.9, compatible with Python 3.13
+
+# Core build tools (needed first)
+setuptools>=69.0.0
+wheel>=0.42.0
 
 # Web Framework
-fastapi==0.109.0
-uvicorn[standard]==0.27.0
-pydantic==2.5.3
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+pydantic>=2.9.0
 
-# Scientific Computing (from original DUT module)
-numpy==1.24.3
-scipy==1.11.4
-pandas==2.0.3
-matplotlib==3.7.3
+# Scientific Computing (compatible with Python 3.13)
+numpy>=1.26.0,<2.0.0
+scipy>=1.11.0
+pandas>=2.1.0
+matplotlib>=3.8.0
 
-# HTTP Requests (for data fetching)
-requests==2.31.0
+# HTTP Requests
+requests>=2.31.0
 
 # Optional but recommended
-python-multipart==0.0.6
+python-multipart>=0.0.9
+
+# ASGI server
+python-dotenv>=1.0.0
