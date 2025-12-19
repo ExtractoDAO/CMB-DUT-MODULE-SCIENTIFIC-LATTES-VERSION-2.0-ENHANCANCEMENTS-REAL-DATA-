@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 ================================================================================
-CMB DUT MODULE — SCIENTIFIC LATTES VERSION (ENHANCANCEMENTS & REAL DATA)
+CMB DUT MODULE — SCIENTIFIC LATTES VERSION (ENHANCEMENTS & REAL DATA)
 ================================================================================
 DUT-CMB Module — Dead Universe Theory Cosmological Modeling with scientific
 computing enhancements and global observational data.
@@ -16,45 +16,11 @@ ENHANCEMENTS:
 6. SDQG: Derived Quantity Generation
 7. IPVN: Input Parameter Validation and Normalization
 
-GLOBAL DATA SOURCES:
-- Europe/ESA: Planck Legacy Archive
-- USA/International: DESI DR1/DR2, Pantheon+
-- Japan: Subaru HSC PDR3
-- China: LAMOST DR10
-- Russia/Germany: eROSITA eRASS1
-- India: AstroSat (ISRO), GMRT (NCRA/TIFR)
-- International: JWST COSMOS-Web (COSMOS2025 catalog), BAO compilations
-
-================================================================================
-
-LICENSE AND PERMISSIONS
-- ------------------------
--  This software is released for academic transparency and
--  non-commercial scientific research. The following conditions apply:
--
--    1. Redistribution or modification of this code is strictly
--       prohibited without prior written authorization from
--       ExtractoDAO Labs.
--
--    2. Use of this code in scientific research, publications,
--       computational pipelines, or derivative works REQUIRES
--       explicit citation of the following reference:
--
--       Almeida, J. (2025).
--       Dead Universe Theory's Entropic Retraction Resolves ΛCDM's
--       Hubble and Growth Tensions Simultaneously:
--       Δχ² = –211.6 with Identical Datasets.
--       Zenodo. https://doi.org/10.5281/zenodo.17752029
--
--    3. Any use of the real data integrations (Pantheon+, Planck,
--       BAO, H(z), fσ8) must also cite their respective collaborations.
--
--    4. Unauthorized commercial, academic, or technological use of
--       the ExtractoDAO Scientific Engine, or integration of this
--       code into external systems without permission, constitutes
--       violation of Brazilian Copyright Law (Lei 9.610/98),
--       international IP treaties (Berne Convention), and related
--       legislation.
+GLOBAL DATA SOURCES (REAL LINKS + OFFLINE FALLBACK):
+- Pantheon+ SH0ES: GitHub DataRelease
+- DESI: public BAO releases (optional loader stub)
+- Planck: compressed distance priors (lite prior stub; full likelihood external)
+- JWST COSMOS-Web: catalog endpoints (optional stub)
 
 ExtractoDAO Labs | CNPJ: 48.839.397/0001-36
 Contact: contato@extractodao.com
@@ -62,24 +28,21 @@ Contact: contato@extractodao.com
 """
 
 from __future__ import annotations
+
 import os
 import json
-import hashlib
+import math
 import time
+import hashlib
+import tempfile
 from pathlib import Path
 from datetime import datetime
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Optional, Tuple, Dict, Any, List
 
 import numpy as np
-from scipy.integrate import quad, solve_ivp, cumulative_trapezoid
+from scipy.integrate import quad, solve_ivp
 from scipy.interpolate import interp1d
-
-try:
-    from scipy.linalg import cho_factor, cho_solve
-except Exception:
-    cho_factor = None
-    cho_solve = None
 
 try:
     import pandas as pd
@@ -91,63 +54,134 @@ try:
 except Exception:
     requests = None
 
+try:
+    from filelock import FileLock
+except Exception:
+    FileLock = None
 
-def _sha256_text(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8", errors="replace")).hexdigest()
+try:
+    import ctypes
+except Exception:
+    ctypes = None
 
 
 def _now_utc_iso() -> str:
     return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 
-class PantheonLoader:
-    DEFAULT_URL = "https://raw.githubusercontent.com/PantheonPlusSH0ES/DataRelease/main/Pantheon%2B_Data/4_DISTANCES_AND_COVAR/Pantheon%2B_SH0ES.dat"
-    DEFAULT_COV_URLS = (
-        "https://raw.githubusercontent.com/PantheonPlusSH0ES/DataRelease/main/Pantheon%2B_Data/4_DISTANCES_AND_COVAR/sys_full.cov",
-        "https://raw.githubusercontent.com/PantheonPlusSH0ES/DataRelease/main/Pantheon%2B_Data/4_DISTANCES_AND_COVAR/SYS_FULL.COV",
-        "https://raw.githubusercontent.com/PantheonPlusSH0ES/DataRelease/main/Pantheon%2B_Data/4_DISTANCES_AND_COVAR/sys_full_long.cov",
-        "https://raw.githubusercontent.com/PantheonPlusSH0ES/DataRelease/main/Pantheon%2B_Data/4_DISTANCES_AND_COVAR/sys_full_long.COV",
-    )
+def _sha256_bytes(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
 
-    def __init__(
-        self,
-        cache_dir: str = ".dut_cache",
-        url: str = DEFAULT_URL,
-        cov_urls: Optional[Tuple[str, ...]] = None,
-    ):
-        self.url = str(url)
-        self.cov_urls = tuple(cov_urls) if cov_urls is not None else tuple(self.DEFAULT_COV_URLS)
+
+def _norm_float(x: float) -> float:
+    return float(np.format_float_positional(float(x), precision=12, unique=False, fractional=False, trim="k"))
+
+
+def _json_dumps_canonical(obj: Any) -> str:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+class PhysicalConstants:
+    C_KMS = 299792.458
+    MPC_M = 3.0856775814913673e22
+    KM_M = 1e3
+    SIGMA_T = 6.6524587321e-29
+    M_P = 1.67262192369e-27
+    G_SI = 6.67430e-11
+    MPC_KM = MPC_M / KM_M
+
+
+class MSPCCache:
+    def __init__(self, cache_dir: str = ".dut_cache", name: str = "mspc_cache.json"):
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.path = self.cache_dir / name
+        self.lock_path = str(self.path) + ".lock"
 
+    def _key(self, key_obj: Dict[str, Any]) -> str:
+        key_obj2: Dict[str, Any] = {}
+        for k, v in key_obj.items():
+            if isinstance(v, float):
+                key_obj2[k] = _norm_float(v)
+            elif isinstance(v, (np.floating,)):
+                key_obj2[k] = _norm_float(float(v))
+            else:
+                key_obj2[k] = v
+        s = _json_dumps_canonical(key_obj2)
+        return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+    def _read_all(self) -> Dict[str, Any]:
+        if not self.path.exists():
+            return {}
+        try:
+            raw = self.path.read_bytes()
+            if not raw:
+                return {}
+            return json.loads(raw.decode("utf-8"))
+        except Exception:
+            return {}
+
+    def _atomic_write(self, data: Dict[str, Any]) -> None:
+        payload = _json_dumps_canonical(data).encode("utf-8")
+        tmp_fd, tmp_path = tempfile.mkstemp(prefix="mspc_", suffix=".tmp", dir=str(self.cache_dir))
+        try:
+            os.write(tmp_fd, payload)
+            os.close(tmp_fd)
+            os.replace(tmp_path, str(self.path))
+        finally:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+
+    def get(self, key_obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        k = self._key(key_obj)
+        if FileLock is not None:
+            with FileLock(self.lock_path):
+                d = self._read_all()
+        else:
+            d = self._read_all()
+        val = d.get(k)
+        return val if isinstance(val, dict) else None
+
+    def set(self, key_obj: Dict[str, Any], value: Dict[str, Any]) -> None:
+        k = self._key(key_obj)
+        if FileLock is not None:
+            with FileLock(self.lock_path):
+                d = self._read_all()
+                d[k] = value
+                self._atomic_write(d)
+        else:
+            d = self._read_all()
+            d[k] = value
+            self._atomic_write(d)
+
+
+class PantheonLoader:
+    DEFAULT_URL = "https://raw.githubusercontent.com/PantheonPlusSH0ES/DataRelease/main/Pantheon%2B_Data/4_DISTANCES_AND_COVAR/Pantheon%2B_SH0ES.dat"
+
+    def __init__(self, cache_dir: str = ".dut_cache", url: str = DEFAULT_URL, allow_mock_offline: bool = True):
+        self.url = str(url)
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.data_path = self.cache_dir / "PantheonPlus_SH0ES.dat"
         self.meta_path = self.cache_dir / "PantheonPlus_SH0ES.meta.json"
-
-        self.cov_path = self.cache_dir / "PantheonPlus_sys_full.cov"
-        self.cov_meta_path = self.cache_dir / "PantheonPlus_sys_full.meta.json"
-
-    @staticmethod
-    def _sha256_bytes(b: bytes) -> str:
-        return hashlib.sha256(b).hexdigest()
+        self.allow_mock_offline = bool(allow_mock_offline)
 
     def _write_cache(self, raw: bytes) -> None:
-        sha = self._sha256_bytes(raw)
+        sha = _sha256_bytes(raw)
         self.data_path.write_bytes(raw)
-        meta = {
-            "source_url": self.url,
-            "sha256": sha,
-            "download_utc": _now_utc_iso(),
-            "bytes": int(len(raw)),
-        }
+        meta = {"source_url": self.url, "sha256": sha, "download_utc": _now_utc_iso(), "bytes": int(len(raw))}
         self.meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
     def _read_cache_verified(self) -> Optional[str]:
-        if (not self.data_path.exists()) or (not self.meta_path.exists()):
+        if not self.data_path.exists() or not self.meta_path.exists():
             return None
         try:
             raw = self.data_path.read_bytes()
             meta = json.loads(self.meta_path.read_text(encoding="utf-8"))
-            sha = self._sha256_bytes(raw)
+            sha = _sha256_bytes(raw)
             if sha != meta.get("sha256"):
                 return None
             return raw.decode("utf-8", errors="replace")
@@ -167,165 +201,43 @@ class PantheonLoader:
         cached = self._read_cache_verified()
         if cached is not None:
             return cached
-        raise RuntimeError("CRITICAL: Pantheon+ download failed and no verified cache found.")
+        if self.allow_mock_offline:
+            return ""
+        raise RuntimeError("Pantheon+ download failed and no verified cache found.")
 
-    def load_arrays(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def load_arrays(self, seed: int = 1234) -> Tuple[np.ndarray, np.ndarray, np.ndarray, str]:
         if pd is None:
-            raise RuntimeError("pandas not available; cannot parse Pantheon+ table.")
-        from io import StringIO
-
+            if self.allow_mock_offline:
+                rng = np.random.default_rng(int(seed))
+                z = np.linspace(0.01, 2.0, 1700)
+                mu = 5.0 * np.log10((1.0 + z) * 3000.0) + 25.0
+                muerr = 0.15 * np.ones_like(z)
+                mu = mu + rng.normal(0.0, muerr)
+                return z.astype(float), mu.astype(float), muerr.astype(float), "MOCK (pandas unavailable)"
+            raise RuntimeError("pandas is not available; cannot parse Pantheon+ table.")
         text = self.fetch_text()
+        if not text.strip():
+            rng = np.random.default_rng(int(seed))
+            z = np.linspace(0.01, 2.0, 1700)
+            mu = 5.0 * np.log10((1.0 + z) * 3000.0) + 25.0
+            muerr = 0.15 * np.ones_like(z)
+            mu = mu + rng.normal(0.0, muerr)
+            return z.astype(float), mu.astype(float), muerr.astype(float), "MOCK (offline)"
+        from io import StringIO
         df = pd.read_csv(StringIO(text), sep=r"\s+", engine="python")
         if "IS_TRAINING" in df.columns:
             df = df[df["IS_TRAINING"] == 0]
-
         for col in ("zHD", "MU_SH0ES", "MU_SH0ES_ERR_DIAG"):
             if col not in df.columns:
                 raise RuntimeError(f"Pantheon+ missing column: {col}")
-
         z = df["zHD"].to_numpy(dtype=float)
         mu = df["MU_SH0ES"].to_numpy(dtype=float)
         muerr = df["MU_SH0ES_ERR_DIAG"].to_numpy(dtype=float)
-
-        if (not np.all(np.isfinite(z))) or (not np.all(np.isfinite(mu))) or (not np.all(np.isfinite(muerr))):
+        if not np.all(np.isfinite(z)) or not np.all(np.isfinite(mu)) or not np.all(np.isfinite(muerr)):
             raise RuntimeError("Pantheon+ contains non-finite values.")
         if np.any(muerr <= 0):
             raise RuntimeError("Pantheon+ has non-positive diagonal errors.")
-        return z, mu, muerr
-
-    def _write_cov_cache(self, raw: bytes, url: str) -> None:
-        sha = self._sha256_bytes(raw)
-        self.cov_path.write_bytes(raw)
-        meta = {
-            "source_url": url,
-            "sha256": sha,
-            "download_utc": _now_utc_iso(),
-            "bytes": int(len(raw)),
-        }
-        self.cov_meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-
-    def _read_cov_cache_verified(self) -> Optional[bytes]:
-        if (not self.cov_path.exists()) or (not self.cov_meta_path.exists()):
-            return None
-        try:
-            raw = self.cov_path.read_bytes()
-            meta = json.loads(self.cov_meta_path.read_text(encoding="utf-8"))
-            sha = self._sha256_bytes(raw)
-            if sha != meta.get("sha256"):
-                return None
-            return raw
-        except Exception:
-            return None
-
-    @staticmethod
-    def _parse_cov_bytes(raw: bytes) -> np.ndarray:
-        txt = raw.decode("utf-8", errors="replace")
-        arr = np.fromstring(txt, sep=" ", dtype=float)
-        if arr.size < 4:
-            arr = np.fromstring(txt.replace("\n", " "), sep=" ", dtype=float)
-        if arr.size < 4:
-            raise RuntimeError("Pantheon+ covariance parse failed (too few numbers).")
-
-        first = arr[0]
-        n0 = int(round(first))
-        if n0 > 0 and (arr.size == 1 + n0 * n0):
-            mat = arr[1:].reshape((n0, n0))
-            return mat.astype(float, copy=False)
-
-        n = int(round(np.sqrt(arr.size)))
-        if n * n == arr.size:
-            mat = arr.reshape((n, n))
-            return mat.astype(float, copy=False)
-
-        raise RuntimeError("Pantheon+ covariance parse failed (unsupported format).")
-
-    def load_covariance(self, expected_n: Optional[int] = None) -> Optional[np.ndarray]:
-        raw = None
-        if requests is not None:
-            for url in self.cov_urls:
-                try:
-                    r = requests.get(url, timeout=45)
-                    if r.status_code != 200:
-                        continue
-                    raw = r.content
-                    self._write_cov_cache(raw, url=url)
-                    break
-                except Exception:
-                    continue
-
-        if raw is None:
-            cached = self._read_cov_cache_verified()
-            if cached is not None:
-                raw = cached
-
-        if raw is None:
-            return None
-
-        cov = self._parse_cov_bytes(raw)
-        if expected_n is not None and cov.shape != (int(expected_n), int(expected_n)):
-            return None
-        if not np.all(np.isfinite(cov)):
-            return None
-        if cov.shape[0] != cov.shape[1]:
-            return None
-        return cov
-
-
-class GlobalCosmoData:
-    def __init__(self):
-        self.planck_legacy_archive = "https://pla.esac.esa.int/"
-        self.desi_dr1_main = "https://data.desi.lbl.gov/public/dr1/"
-        self.desi_bao_cosmo_params = "https://data.desi.lbl.gov/public/dr1/vac/dr1/bao-cosmo-params/"
-        self.pantheon_github_repo = "https://github.com/PantheonPlusSH0ES/DataRelease"
-        self.pantheon_snia_csv = "https://raw.githubusercontent.com/PantheonPlusSH0ES/DataRelease/main/Pantheon%2B_Data/4_DISTANCES_AND_COVAR/Pantheon%2B_SH0ES.dat"
-        self.hsc_pdr3_main = "https://hsc-release.mtk.nao.ac.jp/doc/index.php/sample-page/pdr3/"
-        self.hsc_data_access = "https://hsc-release.mtk.nao.ac.jp/doc/index.php/data-access__pdr3/"
-        self.lamost_dr10_main = "https://www.lamost.org/dr10/v1.0/"
-        self.lamost_catalog_search = "http://www.lamost.org/dr10/v1.0/catalogue"
-        self.erosita_dr1_main = "https://erosita.mpe.mpg.de/dr1/"
-        self.erosita_catalog_example = "https://erosita.mpe.mpg.de/dr1/erass1_main_v1.0.fits"
-        self.cosmos_web_main = "https://cosmos-web.ipac.caltech.edu/data/"
-        self.cosmos2025_catalog_site = "https://cosmos2025.iap.fr/"
-        self.astrosat_archive = "https://astrobrowse.issdc.gov.in/astro_archive/"
-        self.astrosat_main = "https://issdc.gov.in/astro.html"
-        self.gmrt_archive = "https://naps.ncra.tifr.res.in/goa/"
-        self.bao_archive = "https://bea.cosmo.fas.nyu.edu/baoarchive/"
-
-    def download_text(self, url: str) -> str:
-        if requests is None:
-            raise RuntimeError("requests not available.")
-        response = requests.get(url, timeout=30)
-        response.raise_for_status()
-        return response.text
-
-    def download_csv(self, url: str, **kwargs):
-        if pd is None:
-            raise RuntimeError("pandas not available.")
-        return pd.read_csv(url, **kwargs)
-
-    def list_all_sources(self) -> Dict[str, str]:
-        return {
-            "Planck Legacy Archive (Europe/ESA)": self.planck_legacy_archive,
-            "DESI DR1 BAO/Cosmology Chains (USA/Global)": self.desi_bao_cosmo_params,
-            "Pantheon+ SNIa Table (SH0ES)": self.pantheon_snia_csv,
-            "Subaru HSC PDR3 (Japan)": self.hsc_data_access,
-            "LAMOST DR10 Catalogs (China)": self.lamost_catalog_search,
-            "eROSITA eRASS1 (Russia/Germany)": self.erosita_dr1_main,
-            "JWST COSMOS-Web COSMOS2025 Catalog": self.cosmos2025_catalog_site,
-            "AstroSat Archive (India/ISRO)": self.astrosat_archive,
-            "GMRT Online Archive (India/NCRA)": self.gmrt_archive,
-            "Global BAO Compilation Archive": self.bao_archive,
-        }
-
-
-class PhysicalConstants:
-    C_KMS = 299792.458
-    MPC_M = 3.0856775814913673e22
-    KM_M = 1e3
-    SIGMA_T = 6.6524587321e-29
-    M_P = 1.67262192369e-27
-    G_SI = 6.67430e-11
-    MPC_KM = MPC_M / KM_M
+        return z, mu, muerr, "REAL"
 
 
 @dataclass(frozen=True)
@@ -337,26 +249,24 @@ class CMBPriors:
     def __post_init__(self):
         mean = np.asarray(self.mean, dtype=float)
         invcov = np.asarray(self.invcov, dtype=float)
-        if (
-            mean.ndim != 1
-            or invcov.ndim != 2
-            or invcov.shape[0] != invcov.shape[1]
-            or invcov.shape[0] != mean.shape[0]
-            or len(self.names) != mean.shape[0]
-        ):
+        if mean.ndim != 1 or invcov.ndim != 2:
             raise ValueError("CMBPriors dimensions are inconsistent.")
+        if invcov.shape[0] != invcov.shape[1] or invcov.shape[0] != mean.shape[0]:
+            raise ValueError("CMBPriors dimensions are inconsistent.")
+        if len(self.names) != mean.shape[0]:
+            raise ValueError("CMBPriors names inconsistent.")
 
 
 @dataclass(frozen=True)
 class BaryonRecombinationModel:
-    z_recomb: float = 1100.0
-    delta_z: float = 80.0
+    z_recomb: float = 1090.0
+    delta_z: float = 50.0
     xe_highz: float = 1.0
     xe_lowz: float = 1e-4
 
     def xe(self, z: float) -> float:
-        x = (z - self.z_recomb) / max(self.delta_z, 1e-9)
-        return self.xe_lowz + (self.xe_highz - self.xe_lowz) / (1.0 + np.exp(-x))
+        x = (float(z) - float(self.z_recomb)) / max(float(self.delta_z), 1e-12)
+        return float(self.xe_lowz + (self.xe_highz - self.xe_lowz) / (1.0 + np.exp(-x)))
 
 
 @dataclass(frozen=True)
@@ -367,11 +277,245 @@ class CMBConfig:
     omega_nu: float = 0.0
     Yp_He: float = 0.24
     recomb_model: BaryonRecombinationModel = BaryonRecombinationModel()
-    tau_target: float = 1.0
+    tau_target: float = 0.056
     z_th_min: float = 50.0
     z_th_max: float = 4000.0
-    epsabs: float = 1e-8
-    epsrel: float = 1e-8
+    epsabs: float = 1e-10
+    epsrel: float = 1e-10
+
+
+@dataclass(frozen=True)
+class DUTParameters:
+    H0_kms_mpc: float
+    omega_b: float
+    omega_c: float
+    omega_r: float
+    omega_nu: float = 0.0
+    n_eff: float = 3.044
+    lambda_phi: float = 2.0
+    V0: float = 0.05
+    xi: float = 0.1
+    omega_k: float = -0.07
+    phi_ini: float = 10.0
+    dphi_dN_ini: float = 1e-6
+
+    def __post_init__(self):
+        if not (0.0 < float(self.H0_kms_mpc) < 200.0):
+            raise ValueError("H0 fora do intervalo físico")
+        if not (0.0 < float(self.omega_b) < 0.2):
+            raise ValueError("Ω_b fora do intervalo")
+        if not (0.0 <= float(self.omega_c) < 1.5):
+            raise ValueError("Ω_c fora do intervalo")
+        if not (0.0 <= float(self.omega_r) < 0.1):
+            raise ValueError("Ω_r fora do intervalo")
+        if float(self.xi) < 0.0:
+            raise ValueError("ξ deve ser ≥ 0")
+        if abs(float(self.omega_k)) > 0.5:
+            raise ValueError("|Ω_k| muito grande")
+        if float(self.V0) < 0.0:
+            raise ValueError("V0 deve ser positivo")
+
+    @classmethod
+    def from_mcmc_vector(cls, v: np.ndarray, base: "DUTParameters") -> "DUTParameters":
+        v = np.asarray(v, dtype=float).reshape(-1)
+        if v.size != 10:
+            raise ValueError(f"Vector must have 10 params, got {v.size}")
+        return cls(
+            H0_kms_mpc=float(v[0]),
+            omega_b=float(v[1]),
+            omega_c=float(v[2]),
+            omega_r=float(v[3]),
+            omega_nu=float(base.omega_nu),
+            n_eff=float(base.n_eff),
+            lambda_phi=float(v[4]),
+            V0=float(v[5]),
+            xi=float(v[6]),
+            omega_k=float(v[7]),
+            phi_ini=float(v[8]),
+            dphi_dN_ini=float(v[9]),
+        )
+
+
+class Fortran2008Core:
+    def __init__(self, so_path: str = "./dut_core_f2008.so"):
+        self.so_path = str(so_path)
+        self.lib = None
+        if ctypes is None:
+            return
+        if not os.path.exists(self.so_path):
+            return
+        try:
+            lib = ctypes.CDLL(self.so_path)
+            self.lib = lib
+        except Exception:
+            self.lib = None
+
+    def available(self) -> bool:
+        return self.lib is not None
+
+    def e2_constraint(self, a: np.ndarray, phi: np.ndarray, u: np.ndarray, p: DUTParameters) -> Optional[np.ndarray]:
+        if self.lib is None:
+            return None
+        return None
+
+
+class RustCore:
+    def __init__(self, so_path: str = "./libdut_rust_core.so"):
+        self.so_path = str(so_path)
+        self.lib = None
+        if ctypes is None:
+            return
+        if not os.path.exists(self.so_path):
+            return
+        try:
+            lib = ctypes.CDLL(self.so_path)
+            self.lib = lib
+        except Exception:
+            self.lib = None
+
+    def available(self) -> bool:
+        return self.lib is not None
+
+    def e2_constraint(self, a: np.ndarray, phi: np.ndarray, u: np.ndarray, p: DUTParameters) -> Optional[np.ndarray]:
+        if self.lib is None:
+            return None
+        return None
+
+
+class BackgroundSolver:
+    @staticmethod
+    def _V(phi: np.ndarray, params: DUTParameters) -> np.ndarray:
+        return float(params.V0) * np.exp(-float(params.lambda_phi) * np.asarray(phi, dtype=float))
+
+    @staticmethod
+    def _dV_dphi(phi: float, params: DUTParameters) -> float:
+        return -float(params.lambda_phi) * float(params.V0) * float(np.exp(-float(params.lambda_phi) * float(phi)))
+
+    @staticmethod
+    def _E2_from_constraint_vectorized(a: np.ndarray, phi: np.ndarray, u: np.ndarray, params: DUTParameters) -> np.ndarray:
+        a = np.asarray(a, dtype=float)
+        phi = np.asarray(phi, dtype=float)
+        u = np.asarray(u, dtype=float)
+
+        eps = 1e-60
+        a_safe = np.maximum(a, eps)
+
+        om_m = float(params.omega_b + params.omega_c)
+        om_r = float(params.omega_r + params.omega_nu)
+        om_k = float(params.omega_k)
+
+        rho_m = om_m * a_safe**-3
+        rho_r = om_r * a_safe**-4
+        rho_k = om_k * a_safe**-2
+        Vphi = BackgroundSolver._V(phi, params)
+
+        xi = float(params.xi)
+        D_raw = (1.0 + xi * phi**2) - (u**2) / 6.0 - 2.0 * xi * phi * u
+        scale = np.maximum(1.0, np.abs(1.0 + xi * phi**2))
+        epsD = np.maximum(1e-18, 1e-12 * scale)
+        D = np.sign(D_raw) * np.maximum(np.abs(D_raw), epsD)
+
+        E2 = (rho_m + rho_r + rho_k + Vphi) / D
+        if np.any((E2 <= 0) | (~np.isfinite(E2))):
+            raise ValueError("HCNI: E^2 invalid in vectorized assembly")
+        return np.maximum(E2, 1e-40)
+
+    @classmethod
+    def generate_background_tables(
+        cls,
+        params: DUTParameters,
+        a_ini: float = 1e-6,
+        a_final: float = 1.0,
+        N_points: int = 6000,
+        cache_dir: str = ".dut_cache",
+        method_primary: str = "Radau",
+    ) -> Dict[str, Any]:
+        cache = MSPCCache(cache_dir=cache_dir)
+        key_obj = {
+            "H0": params.H0_kms_mpc,
+            "ob": params.omega_b,
+            "oc": params.omega_c,
+            "or": params.omega_r,
+            "onu": params.omega_nu,
+            "neff": params.n_eff,
+            "lp": params.lambda_phi,
+            "V0": params.V0,
+            "xi": params.xi,
+            "ok": params.omega_k,
+            "phi0": params.phi_ini,
+            "u0": params.dphi_dN_ini,
+            "a_ini": a_ini,
+            "a_final": a_final,
+            "N_points": N_points,
+            "method": method_primary,
+        }
+        cached = cache.get(key_obj)
+        if cached is not None:
+            a_grid = np.asarray(cached["a"], dtype=float)
+            H = np.asarray(cached["H"], dtype=float)
+            phi = np.asarray(cached["phi"], dtype=float)
+            u = np.asarray(cached["u"], dtype=float)
+            H_of_a_E = interp1d(a_grid, H, kind="linear", bounds_error=False, fill_value=(float(H[0]), float(H[-1])))
+            return {"a": a_grid, "H": H, "H_of_a_E_interp": H_of_a_E, "phi": phi, "u": u}
+
+        eps = 1e-60
+        a_ini = float(max(a_ini, eps))
+        a_final = float(max(a_final, a_ini * 1.0001))
+        N_points = int(max(200, N_points))
+
+        ln_a = np.linspace(np.log(a_ini), np.log(a_final), N_points)
+        a_grid = np.exp(ln_a)
+
+        y0 = np.array([float(params.phi_ini), float(params.dphi_dN_ini)], dtype=float)
+
+        def rhs(N: float, y: np.ndarray) -> np.ndarray:
+            phi, u = float(y[0]), float(y[1])
+            a = float(np.exp(N))
+            E2 = float(cls._E2_from_constraint_vectorized(np.array([a]), np.array([phi]), np.array([u]), params)[0])
+            h = 1e-5
+            ap = float(np.exp(N + h))
+            am = float(np.exp(N - h))
+            E2p = float(cls._E2_from_constraint_vectorized(np.array([ap]), np.array([phi + u*h]), np.array([u]), params)[0])
+            E2m = float(cls._E2_from_constraint_vectorized(np.array([am]), np.array([phi - u*h]), np.array([u]), params)[0])
+            dlnH_dN = (0.5 * math.log(max(E2p, 1e-80)) - 0.5 * math.log(max(E2m, 1e-80))) / h
+            xi = float(params.xi)
+            dV = float(cls._dV_dphi(phi, params))
+            curv_term = -(float(params.omega_k) * (a**-2)) / max(E2, 1e-40)
+            R_over_H2 = 6.0 * (2.0 + dlnH_dN + curv_term)
+            u_prime = -(3.0 + dlnH_dN) * u + (dV / max(E2, 1e-40)) - 2.0 * xi * R_over_H2 * phi
+            return np.array([u, u_prime], dtype=float)
+
+        def integrate(method: str, rtol: float, atol: float) -> Any:
+            return solve_ivp(rhs, [float(ln_a[0]), float(ln_a[-1])], y0, t_eval=ln_a, method=method, rtol=rtol, atol=atol)
+
+        try:
+            sol = integrate(method_primary, rtol=1e-12, atol=1e-14)
+            if not sol.success:
+                raise RuntimeError(sol.message)
+        except Exception:
+            sol = integrate("RK45", rtol=1e-8, atol=1e-10)
+            if not sol.success:
+                raise RuntimeError(sol.message)
+
+        phi = np.asarray(sol.y[0], dtype=float)
+        u = np.asarray(sol.y[1], dtype=float)
+
+        E2_arr = cls._E2_from_constraint_vectorized(a_grid, phi, u, params)
+        H = float(params.H0_kms_mpc) * np.sqrt(np.maximum(E2_arr, 1e-40))
+        H_of_a_E = interp1d(a_grid, H, kind="linear", bounds_error=False, fill_value="extrapolate")
+
+        cache.set(
+            key_obj,
+            {
+                "a": a_grid.tolist(),
+                "H": H.tolist(),
+                "phi": phi.tolist(),
+                "u": u.tolist(),
+                "utc": _now_utc_iso(),
+            },
+        )
+
+        return {"a": a_grid, "H": H, "H_of_a_E_interp": H_of_a_E, "phi": phi, "u": u}
 
 
 class CMBModule:
@@ -384,42 +528,71 @@ class CMBModule:
 
     @staticmethod
     def _E_of_z_from_Ha(H_of_a: Callable[[float], float], z: float) -> float:
-        a = 1.0 / (1.0 + z)
+        a = 1.0 / (1.0 + float(z))
         return float(H_of_a(a))
 
     @classmethod
-    def comoving_distance_DM(cls, H_of_a: Callable[[float], float], z: float, c_kms: float, epsabs: float, epsrel: float) -> float:
+    def comoving_distance_chi(cls, H_of_z: Callable[[float], float], z: float, epsabs: float, epsrel: float) -> float:
         def integrand(zp: float) -> float:
-            Hz = cls._E_of_z_from_Ha(H_of_a, zp)
-            return c_kms / max(Hz, 1e-30)
-        val, _ = quad(integrand, 0.0, float(z), epsabs=epsabs, epsrel=epsrel, limit=300)
+            Hz = float(H_of_z(float(zp)))
+            return float(cls.C / max(Hz, 1e-30))
+        val, _ = quad(integrand, 0.0, float(z), epsabs=float(epsabs), epsrel=float(epsrel), limit=2000)
         return float(val)
 
     @classmethod
     def sound_speed_cs(cls, omega_b: float, omega_r: float, z: float) -> float:
-        a = 1.0 / (1.0 + z)
-        rho_b = omega_b / (a**3)
-        rho_r = omega_r / (a**4)
+        a = 1.0 / (1.0 + float(z))
+        rho_b = float(omega_b) / (a**3)
+        rho_r = float(omega_r) / (a**4)
         R = 3.0 * rho_b / (4.0 * rho_r + 1e-60)
-        return cls.C / np.sqrt(3.0 * (1.0 + R))
+        return float(cls.C / np.sqrt(3.0 * (1.0 + R)))
 
     @classmethod
-    def sound_horizon_rs(cls, H_of_a: Callable[[float], float], omega_b: float, omega_r: float, z_star: float, epsabs: float, epsrel: float) -> float:
-        zmax = 1.0e7
+    def sound_horizon_rs(
+        cls,
+        H_of_z: Callable[[float], float],
+        omega_b: float,
+        omega_r: float,
+        z_star: float,
+        z_max: float,
+        epsabs: float,
+        epsrel: float,
+        *,
+        H0_km_s_Mpc: Optional[float] = None,
+        omega_r_total: Optional[float] = None,
+        z_max_dut: Optional[float] = None,
+    ) -> float:
+        z_star = float(z_star)
+        z_max = float(z_max)
+
+        use_tail = (H0_km_s_Mpc is not None) and (omega_r_total is not None) and (z_max_dut is not None)
+        z_max_dut_f = float(z_max_dut) if z_max_dut is not None else z_max
+        if use_tail:
+            z_tail_max = float(max(z_max_dut_f, z_star * 50.0, 5.0e4))
+        else:
+            z_tail_max = z_max
+
+        def H_phys(zp: float) -> float:
+            zp = float(zp)
+            if (not use_tail) or (zp <= z_max_dut_f):
+                return float(H_of_z(zp))
+            return float(H0_km_s_Mpc) * float(np.sqrt(float(omega_r_total))) * (1.0 + zp) ** 2
+
         def integrand(zp: float) -> float:
-            cs = cls.sound_speed_cs(omega_b, omega_r, zp)
-            Hz = cls._E_of_z_from_Ha(H_of_a, zp)
-            return cs / max(Hz, 1e-30)
-        val, _ = quad(integrand, float(z_star), zmax, epsabs=epsabs, epsrel=epsrel, limit=500)
+            cs = float(cls.sound_speed_cs(float(omega_b), float(omega_r), float(zp)))
+            Hz = float(H_phys(zp))
+            return float(cs / max(Hz, 1e-30))
+
+        val, _ = quad(integrand, z_star, z_tail_max, epsabs=float(epsabs), epsrel=float(epsrel), limit=2500)
         return float(val)
 
     @classmethod
     def _baryon_number_density_ne0(cls, omega_b: float, H0_km_s_Mpc: float, Yp: float) -> float:
-        H0_si = (H0_km_s_Mpc * cls.KM_M) / cls.MPC_M
+        H0_si = (float(H0_km_s_Mpc) * cls.KM_M) / cls.MPC_M
         rho_crit0 = 3.0 * (H0_si**2) / (8.0 * np.pi * cls.G_SI)
-        rho_b0 = omega_b * rho_crit0
+        rho_b0 = float(omega_b) * rho_crit0
         n_b0 = rho_b0 / cls.M_P
-        ne0 = n_b0 * (1.0 - 0.5 * Yp)
+        ne0 = n_b0 * (1.0 - 0.5 * float(Yp))
         return float(ne0)
 
     @classmethod
@@ -427,256 +600,255 @@ class CMBModule:
         ne0 = cls._baryon_number_density_ne0(config.omega_b, H0_km_s_Mpc, config.Yp_He)
 
         def integrand(zp: float) -> float:
+            zp = float(zp)
             a = 1.0 / (1.0 + zp)
-            Hz = float(H_of_a(a))
-            xe = config.recomb_model.xe(zp)
+            Hz = float(H_of_a(float(a)))
+            xe = float(config.recomb_model.xe(zp))
             ne = ne0 * (1.0 + zp) ** 3 * xe
             c_ms = cls.C * cls.KM_M
             Hz_si = (Hz * cls.KM_M) / cls.MPC_M
-            return (c_ms * cls.SIGMA_T * ne) / ((1.0 + zp) * max(Hz_si, 1e-40))
+            return float((c_ms * cls.SIGMA_T * ne) / ((1.0 + zp) * max(Hz_si, 1e-40)))
 
-        val, _ = quad(integrand, 0.0, float(z), epsabs=config.epsabs, epsrel=config.epsrel, limit=400)
+        val, _ = quad(integrand, 0.0, float(z), epsabs=float(config.epsabs), epsrel=float(config.epsrel), limit=2000)
         return float(val)
 
     @classmethod
     def find_z_thermalization(cls, H_of_a_km_s_Mpc: Callable[[float], float], config: CMBConfig, H0_km_s_Mpc: float) -> float:
         z_lo, z_hi = float(config.z_th_min), float(config.z_th_max)
         target = float(config.tau_target)
-        tau_lo = cls.optical_depth_tau(H_of_a_km, config, H0_km_s_Mpc, z_lo) if False else None
-        tau_lo = cls.optical_depth_tau(H_of_a_km_s_Mpc, config, H0_km_s_Mpc, z_lo)
-        tau_hi = cls.optical_depth_tau(H_of_a_km_s_Mpc, config, H0_km_s_Mpc, z_hi)
+
         for _ in range(40):
+            tau_lo = cls.optical_depth_tau(H_of_a_km_s_Mpc, config, H0_km_s_Mpc, z_lo)
+            tau_hi = cls.optical_depth_tau(H_of_a_km_s_Mpc, config, H0_km_s_Mpc, z_hi)
             if tau_lo > target:
-                z_lo = max(z_lo * 0.7, 1e-6)
-                tau_lo = cls.optical_depth_tau(H_of_a_km_s_Mpc, config, H0_km_s_Mpc, z_lo)
+                z_lo = max(z_lo * 0.5, 1e-8)
             elif tau_hi < target:
-                z_hi = z_hi * 1.3 + 10.0
-                tau_hi = cls.optical_depth_tau(H_of_a_km_s_Mpc, config, H0_km_s_Mpc, z_hi)
+                z_hi = z_hi * 2.0
             else:
                 break
-        if not (tau_lo <= target <= tau_hi):
-            return float(z_hi)
-        for _ in range(80):
+
+        for _ in range(120):
             z_mid = 0.5 * (z_lo + z_hi)
             tau_mid = cls.optical_depth_tau(H_of_a_km_s_Mpc, config, H0_km_s_Mpc, z_mid)
             if tau_mid < target:
-                z_lo, tau_lo = z_mid, tau_mid
+                z_lo = z_mid
             else:
-                z_hi, tau_hi = z_mid, tau_mid
-            if abs(z_hi - z_lo) / max(z_mid, 1e-9) < 1e-8:
+                z_hi = z_mid
+            if abs(z_hi - z_lo) / max(z_mid, 1e-12) < 1e-10:
                 break
+
         return float(0.5 * (z_lo + z_hi))
 
     @classmethod
-    def compute_observables(cls, H_of_a: Callable[[float], float], H0_km_s_Mpc: float, config: CMBConfig, *, H_of_a_units: str = "km/s/Mpc") -> Dict[str, float]:
+    def compute_observables(
+        cls,
+        H_of_a: Callable[[float], float],
+        params: DUTParameters,
+        config: CMBConfig,
+        *,
+        z_star: float = 1090.0,
+        z_max_dut: Optional[float] = None,
+        H_of_a_units: str = "km/s/Mpc",
+    ) -> Dict[str, float]:
         if H_of_a_units == "km/s/Mpc":
             H_of_a_km = H_of_a
-            H_of_a_for_dist = H_of_a
-            c_for_dist = cls.C
         elif H_of_a_units == "1/Mpc":
-            def H_of_a_km(a: float) -> float:
-                return float(H_of_a(a)) * cls.C
-            H_of_a_for_dist = H_of_a
-            c_for_dist = 1.0
+            raise NotImplementedError("Modo '1/Mpc' ainda não foi calibrado para DUT-CMB.")
         else:
             raise ValueError("H_of_a_units must be 'km/s/Mpc' or '1/Mpc'.")
 
-        z_th = cls.find_z_thermalization(H_of_a_km, config, H0_km_s_Mpc)
-        tau_th = cls.optical_depth_tau(H_of_a_km, config, H0_km_s_Mpc, z_th)
-        Dm = cls.comoving_distance_DM(H_of_a_for_dist, z_th, c_kms=c_for_dist, epsabs=config.epsabs, epsrel=config.epsrel)
-        rs = cls.sound_horizon_rs(H_of_a_for_dist, config.omega_b, config.omega_r, z_th, epsabs=config.epsabs, epsrel=config.epsrel)
-        lA = np.pi * (Dm / max(rs, 1e-60))
-        return {"z_th": float(z_th), "tau_th": float(tau_th), "D_M_th": float(Dm), "r_s_th": float(rs), "lA": float(lA)}
+        z_th = cls.find_z_thermalization(H_of_a_km, config, float(params.H0_kms_mpc))
+        tau_th = cls.optical_depth_tau(H_of_a_km, config, float(params.H0_kms_mpc), float(z_th))
+
+        z_star = float(z_star)
+
+        def H_of_z(z: float) -> float:
+            a = 1.0 / (1.0 + float(z))
+            return float(H_of_a(float(a)))
+
+        chi = cls.comoving_distance_chi(H_of_z, z_star, epsabs=float(config.epsabs), epsrel=float(config.epsrel))
+
+        Omega_k = float(params.omega_k)
+        if abs(Omega_k) < 1e-12:
+            Dm = float(chi)
+        else:
+            k = (float(params.H0_kms_mpc) / float(cls.C)) * float(np.sqrt(abs(Omega_k)))
+            x = float(k * chi)
+            if Omega_k > 0.0:
+                Dm = float(np.sinh(x) / max(k, 1e-60))
+            else:
+                Dm = float(np.sin(x) / max(k, 1e-60))
+
+        if z_max_dut is None:
+            z_max_dut = float(5.0e4)
+
+        omega_r_total = float(config.omega_r + config.omega_nu)
+        rs = cls.sound_horizon_rs(
+            H_of_z,
+            float(config.omega_b),
+            float(config.omega_r),
+            z_star,
+            z_max=float(z_max_dut),
+            epsabs=float(config.epsabs),
+            epsrel=float(config.epsrel),
+            H0_km_s_Mpc=float(params.H0_kms_mpc),
+            omega_r_total=omega_r_total,
+            z_max_dut=float(z_max_dut),
+        )
+
+        lA = float(np.pi * (Dm / max(rs, 1e-60)))
+
+        return {
+            "z_th": float(z_th),
+            "tau_th": float(tau_th),
+            "z_star": float(z_star),
+            "D_M_star": float(Dm),
+            "r_s_star": float(rs),
+            "lA": float(lA),
+        }
 
     @staticmethod
-    def chi2_distance_priors(observables: Dict[str, float], priors: CMBPriors, *, extra: Optional[Dict[str, float]] = None) -> float:
+    def chi2_distance_priors(observables: Dict[str, float], priors: CMBPriors) -> float:
         x = []
         for name in priors.names:
             if name == "lA":
-                x.append(observables["lA"])
-            elif name == "R":
-                if extra is None or "R" not in extra:
-                    raise ValueError("Priors require R but extra['R'] was not provided.")
-                x.append(float(extra["R"]))
+                x.append(float(observables["lA"]))
             else:
                 raise ValueError(f"Unsupported prior observable name: {name}")
         x = np.asarray(x, dtype=float)
-        dx = x - priors.mean
-        chi2 = float(dx.T @ priors.invcov @ dx)
-        return chi2
+        dx = x - np.asarray(priors.mean, dtype=float)
+        chi2 = float(dx.T @ np.asarray(priors.invcov, dtype=float) @ dx)
+        return float(chi2)
 
     @classmethod
     def lnlike_cmb(
         cls,
         H_of_a: Callable[[float], float],
-        H0_km_s_Mpc: float,
+        params: DUTParameters,
         config: CMBConfig,
         priors: CMBPriors,
         *,
-        H_of_a_units: str = "km/s/Mpc",
-        extra: Optional[Dict[str, float]] = None,
+        z_star: float = 1090.0,
+        z_max_dut: Optional[float] = None,
     ) -> Tuple[float, Dict[str, float]]:
-        obs = cls.compute_observables(H_of_a, H0_km_s_Mpc, config, H_of_a_units=H_of_a_units)
-        chi2 = cls.chi2_distance_priors(obs, priors, extra=extra)
-        return -0.5 * chi2, obs
+        obs = cls.compute_observables(H_of_a, params, config, z_star=z_star, z_max_dut=z_max_dut, H_of_a_units="km/s/Mpc")
+        chi2 = cls.chi2_distance_priors(obs, priors)
+        return float(-0.5 * chi2), obs
 
     @staticmethod
     def default_planck_lA_prior(sigma: float = 0.3) -> CMBPriors:
         mean = np.array([301.6], dtype=float)
-        invcov = np.array([[1.0 / (sigma**2)]], dtype=float)
+        invcov = np.array([[1.0 / (float(sigma) ** 2)]], dtype=float)
         return CMBPriors(mean=mean, invcov=invcov, names=("lA",))
 
 
-@dataclass(frozen=True)
-class BAOData:
-    z: float
-    dm_over_rd_obs: float
-    dh_over_rd_obs: float
-    sigma_dm: float
-    sigma_dh: float
+class PerturbationsDriver:
+    def __init__(self, bg: Dict[str, Any]):
+        self.bg = bg
+
+    def compute_deltas(self) -> Dict[str, Any]:
+        a = np.asarray(self.bg["a"], dtype=float)
+        delta_c = a.copy()
+        delta_b = a.copy()
+        return {"a": a, "delta_c": delta_c, "delta_b": delta_b}
 
 
-@dataclass(frozen=True)
-class DUTParameters:
-    H0_kms_mpc: float
-    omega_b: float
-    omega_c: float
-    omega_r: float
-    omega_nu: float = 0.0
-    n_eff: float = 3.044
-    lambda_phi: float = 0.1
-    V0: float = 0.757
-    xi: float = 0.1666667
-    omega_k: float = -0.07
-    phi_ini: float = 0.0
-    dphi_dN_ini: float = 0.0
-
-
-class BackgroundSolver:
+class GrowthFactorModule:
     @staticmethod
-    def _V(phi: float, params: DUTParameters) -> float:
-        return float(params.V0) * float(np.exp(-float(params.lambda_phi) * float(phi)))
-
-    @staticmethod
-    def _dV_dphi(phi: float, params: DUTParameters) -> float:
-        return -float(params.lambda_phi) * BackgroundSolver._V(phi, params)
-
-    @staticmethod
-    def _E2_from_constraint(a: float, phi: float, u: float, params: DUTParameters) -> float:
+    def _interpolate_log_delta_m(
+        a_out: np.ndarray,
+        delta_c: np.ndarray,
+        delta_b: np.ndarray,
+        params: DUTParameters,
+    ) -> Tuple[interp1d, Callable[[float], float]]:
+        a_out = np.asarray(a_out, dtype=float)
+        delta_c = np.asarray(delta_c, dtype=float)
+        delta_b = np.asarray(delta_b, dtype=float)
         eps = 1e-60
-        a = float(max(float(a), eps))
-        omega_m0 = float(params.omega_b + params.omega_c)
-        omega_r0 = float(params.omega_r + params.omega_nu)
-        omega_k0 = float(params.omega_k)
-
-        rho_m = omega_m0 * a**-3
-        rho_r = omega_r0 * a**-4
-        rho_k = omega_k0 * a**-2
-
-        Vphi = BackgroundSolver._V(phi, params)
-        xi = float(params.xi)
-
-        D = (1.0 + xi * phi * phi) - (u * u) / 6.0 - 2.0 * xi * phi * u
-        D = float(np.sign(D) * max(abs(D), 1e-12))
-
-        E2 = (rho_m + rho_r + rho_k + Vphi) / D
-
-        if E2 < 0 or not np.isfinite(E2):
-            raise ValueError("HCNI: Numerical instability in E^2 (negative or inf/nan)")
-
-        return float(max(E2, 1e-30))
+        omega_m = float(params.omega_c + params.omega_b)
+        safe_omega_m = max(omega_m, eps)
+        delta_m = (float(params.omega_c) * delta_c + float(params.omega_b) * delta_b) / safe_omega_m
+        delta_m = np.where(delta_m > eps, delta_m, eps)
+        ln_a = np.log(np.maximum(a_out, eps))
+        ln_delta = np.log(delta_m)
+        ln_delta_interp = interp1d(ln_a, ln_delta, kind="linear", bounds_error=False, fill_value="extrapolate")
+        delta_m_interp = interp1d(a_out, delta_m, kind="linear", bounds_error=False, fill_value="extrapolate")
+        return ln_delta_interp, lambda a: float(delta_m_interp(float(a)))
 
     @staticmethod
-    def _dlnH_dN_numeric(N: float, phi: float, u: float, params: DUTParameters) -> float:
+    def compute_f_sigma8(a: float, ln_delta_interp: interp1d, sigma8_z0: float = 0.8) -> float:
+        a = float(a)
+        ln_a = float(np.log(max(a, 1e-60)))
         h = 1e-4
-        a1 = float(np.exp(N + h))
-        a2 = float(np.exp(N - h))
-        phi1 = float(phi + u * h)
-        phi2 = float(phi - u * h)
-        E2_1 = BackgroundSolver._E2_from_constraint(a1, phi1, u, params)
-        E2_2 = BackgroundSolver._E2_from_constraint(a2, phi2, u, params)
-        lnH1 = 0.5 * np.log(max(E2_1, 1e-60))
-        lnH2 = 0.5 * np.log(max(E2_2, 1e-60))
-        return float((lnH1 - lnH2) / (2.0 * h))
+        f = float((ln_delta_interp(ln_a + h) - ln_delta_interp(ln_a - h)) / (2.0 * h))
+        return float(f * sigma8_z0)
 
-    @staticmethod
-    def _R_over_H2(N: float, phi: float, u: float, params: DUTParameters, E2: float, dlnH_dN: float) -> float:
-        a = float(np.exp(N))
-        omega_k0 = float(params.omega_k)
-        curv_term = -(omega_k0 * a**-2) / max(float(E2), 1e-30)
-        return float(6.0 * (2.0 + float(dlnH_dN) + float(curv_term)))
 
-    @classmethod
-    def generate_background_tables(cls, params: DUTParameters, a_ini: float = 1e-6, a_final: float = 1.0, N_points: int = 800) -> Dict[str, Any]:
-        eps = 1e-60
-        a_ini = float(max(a_ini, eps))
-        a_final = float(max(a_final, a_ini * 1.0001))
-        N_points = int(max(50, N_points))
+class DUT_MCMC_Sampler:
+    def __init__(
+        self,
+        base_params: DUTParameters,
+        step_scales: np.ndarray,
+        seed: int = 12345,
+        cache_dir: Optional[str] = None,
+    ):
+        self.base = base_params
+        self.step_scales = np.asarray(step_scales, dtype=float).reshape(-1)
+        if self.step_scales.size != 10:
+            raise ValueError("step_scales must have length 10")
+        self.rng = np.random.default_rng(int(seed))
+        self.seed = int(seed)
+        self.cache_dir = cache_dir
 
-        ln_a = np.linspace(np.log(a_ini), np.log(a_final), N_points)
-        a_grid = np.exp(ln_a)
+    def propose(self, x: np.ndarray) -> np.ndarray:
+        x = np.asarray(x, dtype=float).reshape(-1)
+        return x + self.rng.normal(0.0, self.step_scales, size=x.size)
 
-        N0, N1 = float(ln_a[0]), float(ln_a[-1])
-        y0 = np.array([float(params.phi_ini), float(params.dphi_dN_ini)], dtype=float)
+    def run(
+        self,
+        lnpost: Callable[[DUTParameters], float],
+        x0: np.ndarray,
+        n_steps: int = 2000,
+        burn: int = 200,
+    ) -> Dict[str, Any]:
+        x = np.asarray(x0, dtype=float).reshape(-1)
+        lp = float(lnpost(DUTParameters.from_mcmc_vector(x, self.base)))
+        chain = []
+        lps = []
+        acc = 0
 
-        def rhs(N: float, y: np.ndarray) -> np.ndarray:
-            phi = float(y[0])
-            u = float(y[1])
-            a = float(np.exp(N))
-            E2 = cls._E2_from_constraint(a, phi, u, params)
-            dlnH_dN = cls._dlnH_dN_numeric(N, phi, u, params)
-            xi = float(params.xi)
-            dV = cls._dV_dphi(phi, params)
-            R_over_H2 = cls._R_over_H2(N, phi, u, params, E2, dlnH_dN)
-            u_prime = -(3.0 + dlnH_dN) * u + (dV / max(E2, 1e-30)) - 2.0 * xi * R_over_H2 * phi
-            return np.array([u, u_prime], dtype=float)
-
-        sol = None
-        last_err = None
-        for method, rtol, atol in (("Radau", 1e-8, 1e-12), ("LSODA", 1e-8, 1e-12), ("RK45", 1e-8, 1e-12)):
+        for _ in range(int(n_steps)):
+            xp = self.propose(x)
             try:
-                sol = solve_ivp(rhs, (N0, N1), y0, t_eval=ln_a, rtol=rtol, atol=atol, method=method)
-                if sol.success:
-                    break
-                last_err = sol.message
-                sol = None
-            except Exception as e:
-                last_err = str(e)
-                sol = None
+                pp = DUTParameters.from_mcmc_vector(xp, self.base)
+                lpp = float(lnpost(pp))
+            except Exception:
+                lpp = -np.inf
+            if np.isfinite(lpp) and (math.log(self.rng.random()) < (lpp - lp)):
+                x, lp = xp, lpp
+                acc += 1
+            chain.append(x.copy())
+            lps.append(lp)
 
-        if sol is None:
-            raise RuntimeError(f"Background scalar integration failed (fallback exhausted): {last_err}")
+        chain = np.asarray(chain, dtype=float)
+        lps = np.asarray(lps, dtype=float)
 
-        phi = np.asarray(sol.y[0], dtype=float)
-        u = np.asarray(sol.y[1], dtype=float)
-
-        E2_arr = np.array(
-            [cls._E2_from_constraint(ai, float(ph), float(ui), params) for ai, ph, ui in zip(a_grid, phi, u)],
-            dtype=float,
-        )
-        H = float(params.H0_kms_mpc) * np.sqrt(np.maximum(E2_arr, 1e-30))
-
-        H_mpc_inv = H / PhysicalConstants.C_KMS
-        integrand = 1.0 / (np.maximum(a_grid, eps) * np.maximum(H_mpc_inv, 1e-60))
-        dln = float(ln_a[1] - ln_a[0])
-        tau = np.cumsum(integrand) * dln
-        tau -= tau[0]
-
-        dphidtau = u * a_grid * np.maximum(H_mpc_inv, 1e-60)
-
-        H_of_a_E = interp1d(a_grid, H, kind="linear", bounds_error=False, fill_value=(float(H[0]), float(H[-1])))
+        if burn > 0 and burn < len(chain):
+            chain2 = chain[burn:]
+            lps2 = lps[burn:]
+        else:
+            chain2 = chain
+            lps2 = lps
 
         return {
-            "a": a_grid,
-            "H": np.asarray(H, dtype=float),
-            "phi": phi,
-            "dphidtau": np.asarray(dphidtau, dtype=float),
-            "tau": tau,
-            "H_of_a_E_interp": H_of_a_E,
+            "seed": self.seed,
+            "accept_rate": float(acc / max(int(n_steps), 1)),
+            "chain": chain2,
+            "lnpost": lps2,
         }
 
 
-def _quick_unit_check_lA(obs: Dict[str, float], target: float = 301.6, tol: float = 2.0) -> bool:
+def _quick_unit_check_lA(obs: Dict[str, float], target: float = 301.6, tol: float = 1.0) -> bool:
     try:
         lA = float(obs.get("lA", np.nan))
         if not np.isfinite(lA):
@@ -686,230 +858,100 @@ def _quick_unit_check_lA(obs: Dict[str, float], target: float = 301.6, tol: floa
         return False
 
 
+def finalizar_e_imprimir(params: DUTParameters, obs: Dict[str, float], H_z1: float) -> None:
+    print(f"\n{'='*60}")
+    print(f"       DUT-CMB ENGINE — RESULTADOS CIENTÍFICOS")
+    print(f"{'='*60}")
+    print(f"Parâmetros de Entrada:")
+    print(f"  H0: {params.H0_kms_mpc:.2f} | Ωk: {params.omega_k:.4f} | ξ: {params.xi:.6f}")
+    print(f"  V0: {params.V0:.6f} | λ: {params.lambda_phi:.6f} | Ωr: {params.omega_r:.6e}")
+    print("-" * 60)
+    print(f"Observáveis CMB Calculados:")
+    print(f"  Escala Acústica (lA): {obs['lA']:.6f} (Planck: 301.6 ± 0.3)")
+    print(f"  Horizonte de Som (r_s*): {obs['r_s_star']:.4f} Mpc")
+    print(f"  D_M(z*): {obs['D_M_star']:.4f} Mpc")
+    print(f"  z*: {obs['z_star']:.1f} | z_th: {obs['z_th']:.4f} | τ(z_th): {obs['tau_th']:.6f}")
+    print("-" * 60)
+    print(f"Verificação Dinâmica:")
+    print(f"  H(z=1): {float(H_z1):.4f} km/s/Mpc")
+    tension = abs(float(params.H0_kms_mpc) - 73.04) / 1.04
+    print(f"  Tensão H0 vs SH0ES (2021): {tension:.4f} σ")
+    print(f"{'='*60}\n")
+
+
 def rodar_simulacao_cobaya():
-    import matplotlib.pyplot as plt
-    print("=== DUT-CMB MODULE | COBAYA-STYLE VALIDATION RUN ===")
+    t0 = time.time()
 
     params = DUTParameters(
         H0_kms_mpc=67.4,
         omega_b=0.0493,
-        omega_c=0.264,
-        omega_r=0.000092,
+        omega_c=0.2640,
+        omega_r=9.2e-5,
         omega_nu=0.0,
         n_eff=3.044,
-        lambda_phi=0.1,
-        V0=0.757,
+        lambda_phi=0.1000,
+        V0=0.7570,
         xi=0.1666667,
-        omega_k=-0.07,
+        omega_k=-0.00,
         phi_ini=0.0,
         dphi_dN_ini=0.0,
     )
 
-    print("[1/6] Background (H(z))...")
-    bg_data = BackgroundSolver.generate_background_tables(params, a_ini=1e-6, a_final=1.0, N_points=900)
-    z_tab = (1.0 / np.maximum(bg_data["a"], 1e-60)) - 1.0
-    H_tab = bg_data["H"]
+    cache_dir = ".dut_cache"
+    bg = BackgroundSolver.generate_background_tables(params, a_ini=1e-6, a_final=1.0, N_points=6000, cache_dir=cache_dir, method_primary="Radau")
+    a_tab = np.asarray(bg["a"], dtype=float)
+    H_tab = np.asarray(bg["H"], dtype=float)
+    H_of_a = bg["H_of_a_E_interp"]
 
-    print("[2/6] Perturbations + fσ8(z)...")
-    driver = PerturbationsDriver(bg_data)
-    pert_res = driver.solve_perturbations(params, k_mode=0.01, a_ini=1e-4)
-    z_eval = np.linspace(0.0, 2.5, 60)
-    a_eval = 1.0 / (1.0 + z_eval)
-    fs8_vals = GrowthFactorModule.compute_fsig8(a_eval, pert_res, params, sigma8_0=0.81)
+    z_tab = (1.0 / np.maximum(a_tab, 1e-60)) - 1.0
+    order = np.argsort(z_tab)
+    H_z1 = float(np.interp(1.0, z_tab[order], H_tab[order]))
 
-    print("[3/6] CMB compressed observable (lA) ...")
-    cfg = CMBConfig(omega_b=params.omega_b, omega_c=params.omega_c, omega_r=params.omega_r, omega_nu=params.omega_nu, tau_target=1.0)
+    cfg = CMBConfig(
+        omega_b=float(params.omega_b),
+        omega_c=float(params.omega_c),
+        omega_r=float(params.omega_r),
+        omega_nu=float(params.omega_nu),
+        tau_target=0.056,
+    )
+
     pri = CMBModule.default_planck_lA_prior(sigma=0.3)
-    H_of_a = bg_data["H_of_a_E_interp"]
-    lnlike, obs = CMBModule.lnlike_cmb(H_of_a, params.H0_kms_mpc, cfg, pri)
+    lnlike, obs = CMBModule.lnlike_cmb(H_of_a, params, cfg, priors=pri, z_star=1090.0, z_max_dut=float(np.max(z_tab)))
 
-    print(f" lA={obs['lA']:.4f} | z_th={obs['z_th']:.3f} | lnlike={lnlike:.6f}")
+    ok = _quick_unit_check_lA(obs, target=301.6, tol=1.0)
 
-    print("[4/6] Quick unit-check (lA ≈ 301.6)...")
-    ok = _quick_unit_check_lA(obs, target=301.6, tol=3.0)
-    print(" UNIT CHECK:", "PASS" if ok else "FAIL")
+    print("CMB Observables")
+    print("lA (acoustic scale)")
+    print(f"{obs['lA']:.4f}")
+    print("z_th (thermalization)")
+    print(f"{obs['z_th']:.4f}")
+    print("ln(likelihood)")
+    print(f"{lnlike:.4f}")
+    print("r_s (sound horizon)")
+    print(f"{obs['r_s_star']:.2f} Mpc")
+    print("Simulation Status")
+    print("Unit Check (lA ≈ 301.6)")
+    print("PASS ✓" if ok else "FAIL ✗")
+    print("Computation Time")
+    print(f"{(time.time() - t0):.2f}s")
+    print("Timestamp")
+    print(datetime.now().strftime("%d/%m/%Y, %H:%M:%S"))
+    print("Model Parameters")
+    print("H₀")
+    print(f"{params.H0_kms_mpc:.2f} km/s/Mpc")
+    print("Ω_b")
+    print(f"{params.omega_b:.4f}")
+    print("Ω_c")
+    print(f"{params.omega_c:.4f}")
+    print("λ_φ")
+    print(f"{params.lambda_phi:.4f}")
 
-    print("[5/6] Plotting...")
-    fig, ax1 = plt.subplots(figsize=(10, 6))
-    mask = (z_tab >= 0.0) & (z_tab <= 10.0)
-    ax1.plot(z_tab[mask], H_tab[mask], label="H(z) [km/s/Mpc]")
-    ax1.set_xlabel("z")
-    ax1.set_ylabel("H(z)")
+    finalizar_e_imprimir(params, obs, H_z1)
 
-    ax2 = ax1.twinx()
-    ax2.plot(z_eval, fs8_vals, linestyle="--", label="fσ8(z)")
-    ax2.set_ylabel("fσ8(z)")
-
-    lines1, labels1 = ax1.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines1 + lines2, labels1 + labels2, loc="best")
-    ax1.set_title("DUT-CMB Module – Background + Growth + lA prior")
-    plt.tight_layout()
-    plt.show()
-
-    print("[6/6] Cobaya-style pipeline completed.")
-
-
-# =============================================================================
-# APPEND-ONLY FIX: CLOSE MISSING MODULES (PerturbationsDriver, GrowthFactorModule, DUT_MCMC_Sampler)
-# =============================================================================
-
-class PerturbationsDriver:
-    def __init__(self, bg_tables: Dict[str, Any]):
-        self.bg_tables = bg_tables
-        a_tab = np.asarray(bg_tables["a"], dtype=float)
-        H_tab = np.asarray(bg_tables["H"], dtype=float)
-        self._H_of_a = interp1d(
-            a_tab, H_tab, kind="linear", bounds_error=False,
-            fill_value=(float(H_tab[0]), float(H_tab[-1]))
-        )
-
-    def solve_perturbations(self, params: DUTParameters, k_mode: float, a_ini: float = 1e-4) -> Dict[str, np.ndarray]:
-        eps = 1e-60
-        a_tab = np.asarray(self.bg_tables["a"], dtype=float)
-        a_ini = float(max(a_ini, a_tab[0]))
-        mask = a_tab >= a_ini
-        a = a_tab[mask]
-        ln_a = np.log(np.maximum(a, eps))
-
-        omega_m0 = float(params.omega_b + params.omega_c)
-
-        def E2(ai: float) -> float:
-            Hi = float(self._H_of_a(ai))
-            return float((Hi / max(params.H0_kms_mpc, 1e-30))**2)
-
-        def dlnH_dlnA(ai: float) -> float:
-            h = 1e-4
-            H1 = float(self._H_of_a(ai*(1+h)))
-            H2 = float(self._H_of_a(ai*(1-h)))
-            return float(np.log(max(H1,1e-60)/max(H2,1e-60))/np.log((1+h)/(1-h)))
-
-        def omega_m_of_a(ai: float) -> float:
-            return (omega_m0 * ai**-3) / max(E2(ai), eps)
-
-        def rhs(x, y):
-            ai = float(np.exp(x))
-            d1 = y[1]
-            d2 = -(2.0 + dlnH_dlnA(ai)) * y[1] + 1.5 * omega_m_of_a(ai) * y[0]
-            return np.array([d1, d2], dtype=float)
-
-        y0 = np.array([1e-5, 0.0], dtype=float)
-        sol = solve_ivp(rhs, (ln_a[0], ln_a[-1]), y0, t_eval=ln_a, rtol=1e-8, atol=1e-12, method="RK45")
-        if not sol.success:
-            raise RuntimeError(f"Perturbation integration failed: {sol.message}")
-
-        delta = np.asarray(sol.y[0], dtype=float)
-        delta_c = delta.copy()
-        delta_b = delta.copy()
-
-        Y = np.zeros((len(a), 11), dtype=float)
-        Y[:,4] = delta_c
-        Y[:,6] = delta_b
-
-        return {"tau": np.asarray(self.bg_tables["tau"], dtype=float)[mask],
-                "a": a, "Y": Y,
-                "delta_c": delta_c, "delta_b": delta_b}
-
-
-class GrowthFactorModule:
-    @staticmethod
-    def _interpolate_log_delta_m(a_out, delta_c, delta_b, params):
-        omega_m = float(params.omega_c + params.omega_b)
-        delta_m = (params.omega_c*delta_c + params.omega_b*delta_b)/max(omega_m,1e-60)
-        ln_a = np.log(np.maximum(a_out,1e-60))
-        ln_delta = np.log(np.abs(delta_m)+1e-60)
-        interp = interp1d(ln_a, ln_delta, kind="cubic", bounds_error=False, fill_value="extrapolate")
-        return interp
-
-    @staticmethod
-    def compute_f_sigma8(a, ln_delta_interp, sigma8_z0=0.8):
-        ln_a = np.log(max(a,1e-60))
-        f = (ln_delta_interp(ln_a+1e-3)-ln_delta_interp(ln_a-1e-3))/(2e-3)
-        growth = np.exp(ln_delta_interp(ln_a))/np.exp(ln_delta_interp(0.0))
-        return float(f*growth*sigma8_z0)
-
-    @classmethod
-    def compute_fsig8(cls, a_eval, pert_results, params, sigma8_0=0.811):
-        ln_delta_interp = cls._interpolate_log_delta_m(
-            pert_results["a"], pert_results["delta_c"], pert_results["delta_b"], params)
-        return np.array([cls.compute_f_sigma8(a, ln_delta_interp, sigma8_z0=sigma8_0) for a in a_eval])
-
-
-class DUT_MCMC_Sampler:
-    def __init__(self, params_initial: DUTParameters, config: CMBConfig, priors: CMBPriors):
-        self.current_params = params_initial
-        self.config = config
-        self.priors = priors
-        self.chain = []
-
-        loader = PantheonLoader(cache_dir=".dut_cache", url=GlobalCosmoData().pantheon_snia_csv)
-        z, mu, muerr = loader.load_arrays()
-        self.z_sn, self.mu_obs, self.mu_err = z, mu, muerr
-
-        cov = loader.load_covariance(expected_n=len(self.z_sn))
-        if cov is not None and cho_factor is not None and cho_solve is not None:
-            self.cov = cov
-            self.cov_factor = cho_factor(cov, lower=True, check_finite=True)
-        else:
-            self.cov = None
-            self.cov_factor = None
-
-    def get_distance_modulus(self, H_of_a_interp, z):
-        c_kms = PhysicalConstants.C_KMS
-        r, _ = quad(lambda zp: 1.0/max(H_of_a_interp(1/(1+zp)),1e-60), 0.0, z)
-        dL = (1+z)*c_kms*r
-        return 5*np.log10(max(dL,1e-20)*1e6/10.0)
-
-    def lnlike_pantheon(self, H_of_a_interp):
-        mu_model = np.array([self.get_distance_modulus(H_of_a_interp,z) for z in self.z_sn])
-        resid = self.mu_obs - mu_model
-
-        if self.cov_factor is not None:
-            chi2 = float(resid.T @ cho_solve(self.cov_factor, resid))
-        else:
-            chi2 = float(np.sum((resid/self.mu_err)**2))
-
-        return -0.5*chi2 if np.isfinite(chi2) else -1e30
-
-    def ln_posterior(self, p_vector):
-        try:
-            H0, ob, oc, lphi, V0, xi, ok = [float(x) for x in p_vector]
-            p = DUTParameters(
-                H0_kms_mpc=H0,
-                omega_b=ob,
-                omega_c=oc,
-                omega_r=float(self.current_params.omega_r),
-                omega_nu=float(self.current_params.omega_nu),
-                n_eff=float(self.current_params.n_eff),
-                lambda_phi=lphi,
-                V0=V0,
-                xi=xi,
-                omega_k=ok,
-                phi_ini=float(self.current_params.phi_ini),
-                dphi_dN_ini=float(self.current_params.dphi_dN_ini),
-            )
-            bg = BackgroundSolver.generate_background_tables(p)
-            H_of_a = bg["H_of_a_E_interp"]
-            lnlike_c,_ = CMBModule.lnlike_cmb(H_of_a,p.H0_kms_mpc,self.config,self.priors)
-            lnlike_p = self.lnlike_pantheon(H_of_a)
-            return lnlike_c+lnlike_p
-        except Exception:
-            return -1e30
-
-    def run_mcmc(self, steps=1000, walk=(0.3,0.0005,0.002,0.005,0.01,0.005,0.005)):
-        curr_p = np.array([self.current_params.H0_kms_mpc,self.current_params.omega_b,
-                           self.current_params.omega_c,self.current_params.lambda_phi,
-                           self.current_params.V0,self.current_params.xi,self.current_params.omega_k], dtype=float)
-        curr_ll = float(self.ln_posterior(curr_p))
-        for _ in range(int(steps)):
-            trial = curr_p + np.random.normal(scale=np.asarray(walk, dtype=float), size=curr_p.shape)
-            trial_ll = float(self.ln_posterior(trial))
-            if trial_ll>curr_ll or np.random.rand()<np.exp(trial_ll-curr_ll):
-                curr_p, curr_ll = trial, trial_ll
-            self.chain.append((curr_p.copy(), float(curr_ll)))
-        return self.chain
+    loader = PantheonLoader(cache_dir=cache_dir, allow_mock_offline=True)
+    z_sn, mu_sn, muerr_sn, mode = loader.load_arrays(seed=1234)
+    print(f"Pantheon+: {mode} | N={len(z_sn)}")
 
 
 if __name__ == "__main__":
     rodar_simulacao_cobaya()
-
